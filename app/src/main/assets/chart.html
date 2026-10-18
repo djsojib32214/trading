@@ -1,0 +1,565 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+  <title>ApexTerminal Chart</title>
+  <script src="lightweight-charts.standalone.production.js"></script>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    html, body {
+      width: 100%; height: 100%; overflow: hidden;
+      background: #000000;
+      font-family: 'Roboto Mono', ui-monospace, monospace;
+      touch-action: none;
+      overscroll-behavior: none;
+    }
+    #container { position: relative; width: 100%; height: 100%; }
+    #overlay {
+      position: absolute; left: 0; top: 0;
+      pointer-events: none;
+      z-index: 5;
+    }
+    #container.draw-mode { cursor: crosshair; }
+    #status {
+      position: absolute; left: 8px; top: 6px; z-index: 9;
+      color: #848E9C; font-size: 10px; letter-spacing: .02em;
+      background: rgba(6,7,9,.72); padding: 2px 6px; border-radius: 4px;
+      display: none;
+    }
+  </style>
+</head>
+<body>
+<div id="container">
+  <div id="status"></div>
+</div>
+<canvas id="overlay"></canvas>
+
+<script>
+(function () {
+  "use strict";
+
+  // ------------------------------------------------------------- bridge ---
+  function bridge(fn, args) {
+    try {
+      if (typeof AndroidBridge !== "undefined" && AndroidBridge && typeof AndroidBridge[fn] === "function") {
+        AndroidBridge[fn].apply(AndroidBridge, args || []);
+      }
+    } catch (e) { /* bridge detached during teardown */ }
+  }
+
+  // ---------------------------------------------------------------- state --
+  var chart = null;
+  var candleSeries = null;
+  var volumeSeries = null;
+  var ema20Series = null;
+  var ema50Series = null;
+  var ema200Series = null;
+  var rsiSeries = null;
+  var stochKSeries = null;
+  var stochDSeries = null;
+
+  var oscPaneIndex = -1;
+  var ready = false;
+  var drawMode = "crosshair";
+
+  /** User drawings. Points are stored in LOGICAL/PRICE space so they stay
+   *  glued to the bars through pan, zoom and new-bar shifts. */
+  var drawings = [];
+  var draft = null;
+
+  var overlay = document.getElementById("overlay");
+  var overlayCtx = overlay.getContext("2d");
+  var container = document.getElementById("container");
+  var dpr = window.devicePixelRatio || 1;
+
+  /** How much history the viewport shows when a dataset is (re)loaded. */
+  var VISIBLE_BARS = 110;
+  var RIGHT_OFFSET_BARS = 4;
+
+  var COLORS = {    blue: "#2563EB",
+    blueSoft: "#2563EB44",
+    dark: "#1E222D",
+    darkSoft: "#1E222D44",
+    ema20: "#2962FF",
+    ema50: "#FF9800",
+    ema200: "#E91E63",
+    rsi: "#B388FF",
+    stochK: "#26C6DA",
+    stochD: "#FFB74D",
+    drawing: "#848E9C",
+    drawingActive: "#2563EB"
+  };
+
+  // -------------------------------------------------------------- helpers --
+  function tag(name, opts, paneIndex) {
+    var def = LightweightCharts[name];
+    if (!def) return null;
+    try {
+      return (paneIndex === undefined || paneIndex === null)
+        ? chart.addSeries(def, opts)
+        : chart.addSeries(def, opts, paneIndex);
+    } catch (e) {
+      bridge("onLog", ["addSeries " + name + " failed: " + e]);
+      return null;
+    }
+  }
+
+  function resizeOverlay() {
+    var w = container.clientWidth;
+    var h = container.clientHeight;
+    overlay.style.width = w + "px";
+    overlay.style.height = h + "px";
+    overlay.width = Math.max(1, Math.floor(w * dpr));
+    overlay.height = Math.max(1, Math.floor(h * dpr));
+    overlayCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+
+  function xOf(logical) {
+    var x = chart.timeScale().logicalToCoordinate(logical);
+    return (x === null || x === undefined || isNaN(x)) ? null : x;
+  }
+
+  function yOf(price) {
+    if (!candleSeries) return null;
+    var y = candleSeries.priceToCoordinate(price);
+    return (y === null || y === undefined || isNaN(y)) ? null : y;
+  }
+
+  // ------------------------------------------------------------- drawing --
+  function redraw() {
+    if (!overlayCtx) return;
+    var w = container.clientWidth, h = container.clientHeight;
+    overlayCtx.clearRect(0, 0, w, h);
+    if (!chart || !candleSeries) return;
+
+    for (var i = 0; i < drawings.length; i++) {
+      drawItem(drawings[i], false);
+    }
+    if (draft) drawItem(draft, true);
+  }
+
+  function drawItem(item, isDraft) {
+    if (isDraft === undefined) isDraft = false;
+    var x1 = xOf(item.l1), y1 = yOf(item.p1);
+    var x2 = xOf(item.l2), y2 = yOf(item.p2);
+    if (x1 === null || y1 === null || x2 === null || y2 === null) return;
+
+    var color = isDraft ? COLORS.drawingActive : COLORS.drawing;
+    overlayCtx.save();
+    overlayCtx.strokeStyle = color;
+    overlayCtx.fillStyle = color;
+    overlayCtx.lineWidth = 1.25;
+
+    if (item.type === "ray") {
+      var dx = x2 - x1, dy = y2 - y1;
+      var len = Math.sqrt(dx * dx + dy * dy) || 1;
+      var far = Math.max(container.clientWidth, container.clientHeight) * 3;
+      x2 = x1 + (dx / len) * far;
+      y2 = y1 + (dy / len) * far;
+    }
+
+    if (item.type === "fib") {
+      var levels = [0, 0.236, 0.382, 0.5, 0.618, 0.786, 1];
+      var left = Math.min(x1, x2), right = Math.max(x1, x2);
+      overlayCtx.globalAlpha = 0.12;
+      overlayCtx.fillStyle = COLORS.drawingActive;
+      var spanX = right - left;
+      if (spanX > 1) {
+        overlayCtx.fillRect(left, Math.min(y1, y2), spanX, Math.abs(y2 - y1));
+      }
+      overlayCtx.globalAlpha = 1;
+      overlayCtx.fillStyle = color;
+      overlayCtx.font = "9px 'Roboto Mono', monospace";
+      for (var i = 0; i < levels.length; i++) {
+        var ly = y1 + (y2 - y1) * levels[i];
+        overlayCtx.beginPath();
+        overlayCtx.moveTo(left, ly);
+        overlayCtx.lineTo(right, ly);
+        overlayCtx.stroke();
+        overlayCtx.fillText(levels[i].toFixed(3), right + 3, ly - 2);
+      }
+      overlayCtx.restore();
+      return;
+    }
+
+    overlayCtx.beginPath();
+    overlayCtx.moveTo(x1, y1);
+    overlayCtx.lineTo(x2, y2);
+    overlayCtx.stroke();
+
+    var handles = [x1, y1, x2, y2];
+    for (var h = 0; h < 4; h += 2) {
+      overlayCtx.beginPath();
+      overlayCtx.arc(handles[h], handles[h + 1], 2.5, 0, Math.PI * 2);
+      overlayCtx.fill();
+    }
+    overlayCtx.restore();
+  }
+
+  function pointerToPoint(clientX, clientY) {
+    var rect = container.getBoundingClientRect();
+    var x = clientX - rect.left;
+    var y = clientY - rect.top;
+    var logical = chart.timeScale().coordinateToLogical(x);
+    var price = candleSeries.coordinateToPrice(y);
+    if (logical === null || price === null) return null;
+    return { l: logical, p: price };
+  }
+
+  function onPointerDown(clientX, clientY) {
+    if (drawMode === "crosshair") return;
+    var pt = pointerToPoint(clientX, clientY);
+    if (!pt) return;
+    draft = { type: drawMode, l1: pt.l, p1: pt.p, l2: pt.l, p2: pt.p };
+    redraw();
+  }
+
+  function onPointerMove(clientX, clientY) {
+    if (!draft) return;
+    var pt = pointerToPoint(clientX, clientY);
+    if (!pt) return;
+    draft.l2 = pt.l;
+    draft.p2 = pt.p;
+    redraw();
+  }
+
+  function onPointerUp() {
+    if (!draft) return;
+    var moved = Math.abs(draft.l2 - draft.l1) > 0.15 || Math.abs(draft.p2 - draft.p1) > 1e-9;
+    if (moved) {
+      drawings.push(draft);
+      bridge("onDrawingAdded", [draft.type, drawings.length]);
+    }
+    draft = null;
+    redraw();
+  }
+
+  function installDrawInterceptors() {
+    var capture = { capture: true, passive: false };
+
+    container.addEventListener("touchstart", function (e) {
+      if (drawMode === "crosshair") return;
+      e.preventDefault(); e.stopPropagation();
+      var t = e.touches[0];
+      if (t) onPointerDown(t.clientX, t.clientY);
+    }, capture);
+
+    container.addEventListener("touchmove", function (e) {
+      if (drawMode === "crosshair") return;
+      e.preventDefault(); e.stopPropagation();
+      var t = e.touches[0];
+      if (t) onPointerMove(t.clientX, t.clientY);
+    }, capture);
+
+    container.addEventListener("touchend", function (e) {
+      if (drawMode === "crosshair") return;
+      e.preventDefault(); e.stopPropagation();
+      onPointerUp();
+    }, capture);
+
+    container.addEventListener("mousedown", function (e) {
+      if (drawMode === "crosshair") return;
+      e.preventDefault(); e.stopPropagation();
+      onPointerDown(e.clientX, e.clientY);
+    }, capture);
+
+    container.addEventListener("mousemove", function (e) {
+      if (drawMode === "crosshair") return;
+      e.preventDefault(); e.stopPropagation();
+      onPointerMove(e.clientX, e.clientY);
+    }, capture);
+
+    container.addEventListener("mouseup", function (e) {
+      if (drawMode === "crosshair") return;
+      e.preventDefault(); e.stopPropagation();
+      onPointerUp();
+    }, capture);
+  }
+
+  // ---------------------------------------------------------------- init ---
+  function initChart() {
+    if (ready) return;
+    if (!window.LightweightCharts) {
+      bridge("onLog", ["LightweightCharts bundle missing"]);
+      return;
+    }
+
+    chart = LightweightCharts.createChart(container, {
+      width: container.clientWidth,
+      height: container.clientHeight,
+      autoSize: false,
+      layout: {
+        background: { type: "solid", color: "#000000" },
+        textColor: "#848E9C",
+        fontSize: 10,
+        fontFamily: "Roboto Mono, ui-monospace, monospace",
+        attributionLogo: false
+      },
+      grid: {
+        vertLines: { color: "#0D0E12" },
+        horzLines: { color: "#0D0E12" }
+      },
+      crosshair: {
+        mode: LightweightCharts.CrosshairMode.Normal,
+        vertLine: { color: "#787B86", width: 1, style: 3, labelBackgroundColor: "#1E222D" },
+        horzLine: { color: "#787B86", width: 1, style: 3, labelBackgroundColor: "#1E222D" }
+      },
+      rightPriceScale: {
+        borderColor: "#191C24",
+        scaleMargins: { top: 0.1, bottom: 0.28 },
+        autoScale: true
+      },
+      timeScale: {
+        borderColor: "#191C24",
+        timeVisible: true,
+        secondsVisible: false,
+        shiftVisibleRangeOnNewBar: true,
+        rightOffset: 4,
+        barSpacing: 6
+      },
+      handleScroll: { mouseWheel: false, pressedMouseMove: true, horzTouchDrag: true, vertTouchDrag: false },
+      handleScale: { axisPressedMouseMove: true, mouseWheel: false, pinch: true }
+    });
+
+    // V5 SYNTAX: chart.addSeries(LightweightCharts.CandlestickSeries, options)
+    candleSeries = tag("CandlestickSeries", {
+      upColor: COLORS.blue,
+      downColor: COLORS.dark,
+      borderUpColor: COLORS.blue,
+      borderDownColor: COLORS.blue,
+      wickUpColor: COLORS.blue,
+      wickDownColor: COLORS.blue,
+      priceLineVisible: true,
+      priceLineColor: "#2563EB",
+      priceLineStyle: 3,
+      lastValueVisible: true
+    });
+
+    // V5 SYNTAX: HistogramSeries on the overlay scale for volume
+    volumeSeries = tag("HistogramSeries", {
+      priceFormat: { type: "volume" },
+      priceScaleId: "",
+      lastValueVisible: false,
+      priceLineVisible: false
+    });
+    try {
+      chart.priceScale("").applyOptions({ scaleMargins: { top: 0.8, bottom: 0 } });
+    } catch (e) { /* overlay scale not resolvable on some builds */ }
+
+    // V5 SYNTAX: LineSeries overlays for the EMA ribbon
+    ema20Series = tag("LineSeries", { color: COLORS.ema20, lineWidth: 1, crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false });
+    ema50Series = tag("LineSeries", { color: COLORS.ema50, lineWidth: 1, crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false });
+    ema200Series = tag("LineSeries", { color: COLORS.ema200, lineWidth: 1, crosshairMarkerVisible: false, priceLineVisible: false, lastValueVisible: false });
+
+    chart.subscribeCrosshairMove(function (param) {
+      try {
+        if (!param || !param.time || !param.point || !candleSeries) {
+          bridge("onCrosshairReset", []);
+          return;
+        }
+        var data = param.seriesData ? param.seriesData.get(candleSeries) : null;
+        if (!data || data.open === undefined) {
+          bridge("onCrosshairReset", []);
+          return;
+        }
+        var t = (typeof param.time === "number") ? param.time : null;
+        if (t === null) { bridge("onCrosshairReset", []); return; }
+        bridge("onCrosshairUpdate", [data.open, data.high, data.low, data.close, t]);
+      } catch (e) { /* ignore */ }
+    });
+
+    chart.timeScale().subscribeVisibleLogicalRangeChange(function () { redraw(); });
+
+    if (typeof ResizeObserver !== "undefined") {
+      new ResizeObserver(function () {
+        chart.resize(container.clientWidth, container.clientHeight);
+        resizeOverlay();
+        redraw();
+      }).observe(container);
+    } else {
+      window.addEventListener("resize", function () {
+        chart.resize(container.clientWidth, container.clientHeight);
+        resizeOverlay();
+        redraw();
+      });
+    }
+
+    installDrawInterceptors();
+    resizeOverlay();
+    ready = true;
+    bridge("onChartReady", []);
+  }
+
+  // ------------------------------------------------- public JS API (Kotlin) --
+  window.setInitialData = function (candleJson, volumeJson) {
+    try {
+      var candles = JSON.parse(candleJson || "[]");
+      var volumes = JSON.parse(volumeJson || "[]");
+      if (candleSeries) candleSeries.setData(candles);
+      if (volumeSeries) volumeSeries.setData(volumes);
+      focusRecentBars(candles.length);
+      redraw();
+    } catch (e) {
+      bridge("onLog", ["setInitialData failed: " + e]);
+    }
+  };
+
+  /**
+   * `setData` fits the *entire* history, which on a 1000-bar window leaves
+   * sub-pixel candles. Anchor the viewport on the most recent stretch instead,
+   * which is what a trader expects when the terminal opens.
+   */
+  function focusRecentBars(total) {
+    try {
+      if (!total) return;
+      var visible = Math.min(VISIBLE_BARS, total);
+      chart.timeScale().setVisibleLogicalRange({
+        from: total - visible - 1,
+        to: total + RIGHT_OFFSET_BARS
+      });
+    } catch (e) { /* ignore */ }
+  }
+
+  window.updateLiveTick = function (candleObjJson) {
+    try {
+      var c = JSON.parse(candleObjJson);
+      if (!c || c.time === undefined) return;
+      if (candleSeries) candleSeries.update(c);
+      if (volumeSeries) {
+        volumeSeries.update({
+          time: c.time,
+          value: c.volume === undefined ? 0 : c.volume,
+          color: c.close >= c.open ? "#2563EB44" : "#1E222D44"
+        });
+      }
+    } catch (e) { /* transient parse during symbol swap */ }
+  };
+
+  window.setEmaData = function (ema20Json, ema50Json, ema200Json) {
+    applySeriesData(ema20Series, ema20Json);
+    applySeriesData(ema50Series, ema50Json);
+    applySeriesData(ema200Series, ema200Json);
+  };
+
+  function applySeriesData(series, json) {
+    if (!series) return;
+    try {
+      series.setData(json ? JSON.parse(json) : []);
+    } catch (e) { /* ignore */ }
+  }
+
+  function ensureOscillatorPane() {
+    if (oscPaneIndex >= 0) return;
+    try {
+      var panes = chart.panes();
+      oscPaneIndex = panes.length;
+    } catch (e) {
+      oscPaneIndex = 1;
+    }
+  }
+
+  function applyOscillatorPaneHeights() {
+    try {
+      var panes = chart.panes();
+      if (panes.length > 1) {
+        var oscHeight = 84;
+        for (var i = 1; i < panes.length; i++) panes[i].setHeight(oscHeight);
+      }
+      if (panes.length > 0) panes[0].setStretchFactor(1);
+    } catch (e) { /* pane API unavailable */ }
+  }
+
+  window.setRsiData = function (rsiJson) {
+    try {
+      var data = rsiJson ? JSON.parse(rsiJson) : [];
+      if (!data.length) {
+        if (rsiSeries) { chart.removeSeries(rsiSeries); rsiSeries = null; }
+        applyOscillatorPaneHeights();
+        return;
+      }
+      if (!rsiSeries) {
+        ensureOscillatorPane();
+        rsiSeries = tag("LineSeries", {
+          color: COLORS.rsi, lineWidth: 1, priceLineVisible: false, lastValueVisible: true,
+          priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+          autoscaleInfoProvider: function () { return { priceRange: { minValue: 0, maxValue: 100 } }; }
+        }, oscPaneIndex);
+      }
+      if (rsiSeries) rsiSeries.setData(data);
+      applyOscillatorPaneHeights();
+    } catch (e) { bridge("onLog", ["setRsiData failed: " + e]); }
+  };
+
+  window.setStochData = function (kJson, dJson) {
+    try {
+      var kData = kJson ? JSON.parse(kJson) : [];
+      if (!kData.length) {
+        if (stochKSeries) { chart.removeSeries(stochKSeries); stochKSeries = null; }
+        if (stochDSeries) { chart.removeSeries(stochDSeries); stochDSeries = null; }
+        applyOscillatorPaneHeights();
+        return;
+      }
+      var opts = {
+        lineWidth: 1, priceLineVisible: false, lastValueVisible: false,
+        priceFormat: { type: "price", precision: 2, minMove: 0.01 },
+        autoscaleInfoProvider: function () { return { priceRange: { minValue: 0, maxValue: 100 } }; }
+      };
+      if (!stochKSeries) {
+        ensureOscillatorPane();
+        stochKSeries = tag("LineSeries", Object.assign({ color: COLORS.stochK }, opts), oscPaneIndex);
+      }
+      if (!stochDSeries) {
+        ensureOscillatorPane();
+        stochDSeries = tag("LineSeries", Object.assign({ color: COLORS.stochD }, opts), oscPaneIndex);
+      }
+      if (stochKSeries) stochKSeries.setData(kData);
+      if (stochDSeries) stochDSeries.setData(dJson ? JSON.parse(dJson) : []);
+      applyOscillatorPaneHeights();
+    } catch (e) { bridge("onLog", ["setStochData failed: " + e]); }
+  };
+
+  window.setDrawMode = function (mode) {
+    drawMode = mode || "crosshair";
+    if (drawMode === "crosshair") {
+      container.classList.remove("draw-mode");
+    } else {
+      container.classList.add("draw-mode");
+    }
+    if (drawMode === "clear") {
+      window.clearDrawings();
+      drawMode = "crosshair";
+      container.classList.remove("draw-mode");
+    }
+    redraw();
+  };
+
+  window.clearDrawings = function () {
+    drawings = [];
+    draft = null;
+    redraw();
+  };
+
+  window.fitContent = function () {
+    try { chart.timeScale().fitContent(); } catch (e) { /* ignore */ }
+    redraw();
+  };
+
+  window.scrollToRealtime = function () {
+    try { chart.timeScale().scrollToRealTime(); } catch (e) { /* ignore */ }
+    redraw();
+  };
+
+  window.drawingCount = function () { return drawings.length; };
+
+  // Ready hook: notify Kotlin either on load or immediately if already built.
+  if (document.readyState === "complete" || document.readyState === "interactive") {
+    initChart();
+  } else {
+    window.addEventListener("DOMContentLoaded", initChart);
+  }
+  window.addEventListener("load", initChart);
+})();
+</script>
+</body>
+</html>

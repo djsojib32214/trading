@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">ApexTerminal</string>
+
+    <string name="channel_monitor_name">Market Monitor</string>
+    <string name="channel_monitor_description">Ongoing background strategy monitoring status</string>
+    <string name="channel_alerts_name">Strategy Alerts</string>
+    <string name="channel_alerts_description">Closed-candle strategy condition alerts</string>
+
+    <string name="monitor_action_pause">PAUSE 1 HOUR</string>
+    <string name="monitor_action_stop">STOP MONITOR</string>
+    <string name="monitor_action_open">OPEN CHART</string>
+</resources>
